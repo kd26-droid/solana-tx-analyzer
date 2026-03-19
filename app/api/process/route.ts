@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 
 const ACTIONS_URL = "https://pro-api.solscan.io/v2.0/transaction/actions";
 const DETAIL_URL = "https://pro-api.solscan.io/v2.0/transaction/detail";
+const METADATA_URL = "https://pro-api.solscan.io/v2.0/account/metadata";
 const API_KEY = process.env.SOLSCAN_API_KEY;
 
 if (!API_KEY) {
@@ -56,18 +57,39 @@ async function fetchWithRetry(url: string): Promise<any> {
   return { error: 'Max retries exceeded' };
 }
 
-// Fetch both actions + detail for a single tx (sequential to avoid burst)
+// Cache signer name lookups to avoid duplicate API calls
+const signerNameCache = new Map<string, string | null>();
+
+async function fetchSignerName(address: string): Promise<string | null> {
+  if (signerNameCache.has(address)) return signerNameCache.get(address)!;
+  const meta = await fetchWithRetry(`${METADATA_URL}?address=${address}`);
+  const name = meta?.data?.account_label || meta?.data?.account_domain || null;
+  signerNameCache.set(address, name);
+  return name;
+}
+
+// Fetch actions + detail + signer name for a single tx
 async function fetchTransactionJson(txId: string): Promise<any> {
   const actionsResult = await fetchWithRetry(`${ACTIONS_URL}?tx=${txId}`);
   if (actionsResult?.error) return actionsResult;
 
-  // Small delay between the 2 calls for the same tx
   await new Promise(resolve => setTimeout(resolve, DELAY_BETWEEN_CALLS_MS));
 
   const detailResult = await fetchWithRetry(`${DETAIL_URL}?tx=${txId}`);
   if (actionsResult.data && detailResult?.data) {
-    actionsResult.data.render_one_line_action = detailResult.data.render_one_line_action || [];
-    actionsResult.data.signer = detailResult.data.signer || [];
+    const d = detailResult.data;
+    actionsResult.data.render_one_line_action = d.render_one_line_action || [];
+    actionsResult.data.signer = d.signer || [];
+    actionsResult.data.status = d.status;
+    actionsResult.data.fee = d.fee;
+    actionsResult.data.block_id = d.block_id;
+
+    // Resolve signer name
+    const signerAddr = d.signer?.[0];
+    if (signerAddr) {
+      await new Promise(resolve => setTimeout(resolve, DELAY_BETWEEN_CALLS_MS));
+      actionsResult.data.signer_name = await fetchSignerName(signerAddr);
+    }
   }
 
   return actionsResult;
@@ -187,10 +209,37 @@ function processJson(jsonData: any, txHash: string): any {
   const signer = extractSigner(jsonData);
   const summary = buildSummary(jsonData);
 
+  // Extract new fields from detail data
+  const rola = jsonData?.render_one_line_action || [];
+  let activityType: string | null = null;
+  let tokenAmount: number | null = null;
+  let tokenAddress: string | null = null;
+  let recipientCount: number | null = null;
+
+  for (const item of rola) {
+    if (item.origin_data) {
+      activityType = item.origin_data.activity_type || null;
+      recipientCount = item.origin_data.toAddressList?.length ?? null;
+    }
+    if (item.token_amount && tokenAmount === null) {
+      const ta = item.token_amount;
+      tokenAmount = (ta.number || 0) / Math.pow(10, ta.decimals || 0);
+      tokenAddress = ta.token_address || null;
+    }
+  }
+
   return {
     TX_HASH: txHash,
     SIGNER: signer,
+    SIGNER_NAME: jsonData?.signer_name || null,
+    STATUS: jsonData?.status === 1 ? 'success' : jsonData?.status === 0 ? 'failed' : null,
+    FEE_LAMPORTS: jsonData?.fee ?? null,
+    BLOCK: jsonData?.block_id ?? null,
     SUMMARY: summary,
+    ACTIVITY_TYPE: activityType,
+    TOKEN_AMOUNT: tokenAmount,
+    TOKEN_ADDRESS: tokenAddress,
+    RECIPIENT_COUNT: recipientCount,
     ACTION: filteredActionKeywords.join(', '),
     PROGRAM: programResult.join(', '),
     CHAIN_LABELS: combinedChainLabels,
@@ -294,12 +343,12 @@ export async function POST(request: NextRequest) {
             console.error(`Error processing ${item.txHash}:`, error);
             results.push({
               TX_HASH: item.txHash,
-              SIGNER: '',
-              SUMMARY: '',
-              ACTION: 'ERROR',
-              PROGRAM: 'ERROR',
-              CHAIN_LABELS: '',
-              ERROR: error.message
+              SIGNER: '', SIGNER_NAME: null, STATUS: null,
+              FEE_LAMPORTS: null, BLOCK: null, SUMMARY: '',
+              ACTIVITY_TYPE: null, TOKEN_AMOUNT: null,
+              TOKEN_ADDRESS: null, RECIPIENT_COUNT: null,
+              ACTION: 'ERROR', PROGRAM: 'ERROR',
+              CHAIN_LABELS: '', ERROR: error.message
             });
           }
         }
